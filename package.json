@@ -1,0 +1,14 @@
+{
+  "name": "vaultstream-vercel",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {"node": ">=20"},
+  "scripts": {
+    "build": "esbuild src/admin.js --bundle --format=iife --platform=browser --target=es2020 --outfile=public/admin.js",
+    "check": "node --check api/index.js && node --check lib/security.js && node --check lib/blob-store.js && node --check lib/ui.js",
+    "test": "node --test tests/*.test.js"
+  },
+  "dependencies": {"@vercel/blob": "^2.8.2"},
+  "devDependencies": {"esbuild": "^0.25.0"}
+}

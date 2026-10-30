@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "functions": {"api/index.js": {"maxDuration": 60}},
+  "rewrites": [
+    {"source": "/", "destination": "/api/index?route=/"},
+    {"source": "/admin", "destination": "/api/index?route=/admin"},
+    {"source": "/watch", "destination": "/api/index?route=/watch"},
+    {"source": "/access/:token", "destination": "/api/index?route=/access/:token"},
+    {"source": "/api/:path*", "destination": "/api/index?route=/api/:path*"},
+    {"source": "/health", "destination": "/api/index?route=/health"}
+  ]
+}
