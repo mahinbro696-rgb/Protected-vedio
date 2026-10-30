@@ -199,32 +199,94 @@ function initDashboard() {
       file.dispatchEvent(new Event('change'));
     }
   });
+  // Big source videos must use multipart upload. Single-request uploads often hang at 0%
+  // for files above ~100-200 MB, especially over slower mobile networks.
+  const cancelUpload = byId('upload-cancel-btn');
+  const progressTrack = byId('progress-track');
+  let currentUpload = null;
+  cancelUpload?.addEventListener('click', () => {
+    if (!currentUpload) return;
+    progress.textContent = 'Cancelling upload...';
+    cancelUpload.disabled = true;
+    currentUpload.abort();
+  });
   upload.addEventListener('click', async () => {
-    const selected = file.files?.[0]; if (!selected) return;
+    const selected = file.files?.[0];
+    if (!selected || currentUpload) return;
     if (selected.type !== 'video/mp4' && !selected.name.toLowerCase().endsWith('.mp4')) return msg('Please select an MP4 video.', true);
     if (selected.size > 500 * 1024 * 1024) return msg('The maximum MP4 size is 500 MB.', true);
-    upload.disabled = true; show(byId('progress-track'), true);
-    const bar = byId('progress-fill'); bar.style.width = '0%';
-    progress.textContent = 'Preparing encrypted private upload...';
+    if (selected.size < 128) return msg('This file is empty or invalid.', true);
+    const controller = new AbortController();
+    currentUpload = controller;
+    upload.disabled = true;
+    file.disabled = true;
+    show(progressTrack, true);
+    show(cancelUpload, true);
+    cancelUpload.disabled = false;
+    const bar = byId('progress-fill');
+    bar.style.width = '0%';
+    progressTrack.setAttribute('aria-valuenow', '0');
+    msg('Uploading the original MP4 in reliable chunks — no quality reduction.');
+    progress.textContent = 'Connecting to private storage (0%)...';
+    let sentBytes = 0;
+    const beganAt = Date.now();
+    const waitingMessage = setInterval(() => {
+      if (sentBytes > 0 || controller.signal.aborted) return;
+      const seconds = Math.round((Date.now() - beganAt) / 1000);
+      if (seconds >= 90) {
+        progress.textContent = 'Still 0% after ' + seconds + 's. Check your connection or press Cancel and retry.';
+      } else if (seconds >= 18) {
+        progress.textContent = 'Connecting to private storage... 0% (' + seconds + 's)';
+      }
+    }, 3000);
     try {
       const blob = await uploadToBlob('videos/tutorial.mp4', selected, {
         access: 'private',
+        contentType: 'video/mp4',
         handleUploadUrl: '/api/admin/upload-token',
+        multipart: true,
+        abortSignal: controller.signal,
         onUploadProgress(ev) {
-          bar.style.width = Math.floor(ev.percentage) + '%';
-          progress.textContent = 'Uploading... ' + Math.floor(ev.percentage) + '%';
+          const loaded = Math.max(0, Number(ev.loaded) || 0);
+          const total = Math.max(1, Number(ev.total) || selected.size);
+          sentBytes = Math.max(sentBytes, loaded);
+          const percentage = Math.max(0, Math.min(100, Math.floor(loaded / total * 100)));
+          bar.style.width = percentage + '%';
+          progressTrack.setAttribute('aria-valuenow', String(percentage));
+          progress.textContent = percentage < 100
+            ? 'Uploading chunks... ' + percentage + '% (' + (loaded / 1048576).toFixed(1) +
+                ' / ' + (total / 1048576).toFixed(1) + ' MB)'
+            : '100% transferred. Finalizing and verifying...';
         },
       });
-      await postJson('/api/admin/video/complete', { pathname: blob.pathname, expectedSize: selected.size });
-      msg('Your tutorial is uploaded to private Vercel Blob storage.');
-      progress.textContent = 'Upload complete';
+      if (controller.signal.aborted) return;
+      progress.textContent = 'Upload transferred. Verifying original file size...';
+      const response = await postJson('/api/admin/video/complete', {
+        pathname: blob.pathname, expectedSize: selected.size,
+      });
+      if (response.size !== selected.size) throw new Error('Stored file size did not match the original.');
+      bar.style.width = '100%';
+      progressTrack.setAttribute('aria-valuenow', '100');
+      msg('Video successfully uploaded with original resolution and quality.');
+      progress.textContent = 'Upload complete — ' + (selected.size / 1048576).toFixed(1) + ' MB';
       file.value = '';
       file.dispatchEvent(new Event('change'));
       await loadDashboard();
-    } catch (e) {
-      msg(e.message || 'Private upload failed. Please try again.', true);
-      progress.textContent = 'Upload failed';
-    } finally { upload.disabled = !(file.files?.[0]); }
+    } catch (error) {
+      const cancelled = controller.signal.aborted || error?.name === 'AbortError';
+      const detail = cancelled ? 'Upload cancelled.' : (error?.message || 'Unknown upload error');
+      msg(cancelled ? 'Upload cancelled. Your video was not published.' :
+        'Upload failed: ' + detail + ' · Try again or check browser Network errors.', !cancelled);
+      progress.textContent = cancelled ? 'Cancelled — choose Retry Upload' :
+        'Upload failed. ' + detail;
+    } finally {
+      clearInterval(waitingMessage);
+      currentUpload = null;
+      file.disabled = false;
+      show(cancelUpload, false);
+      cancelUpload.disabled = false;
+      upload.disabled = !(file.files?.[0]);
+    }
   });
   loadDashboard();
 }
