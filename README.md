@@ -20,3 +20,15 @@ For legitimate paid customer services check Vercel plan terms: Hobby is intended
 
 ## Original source
 The portal was adapted from the VaultStream Vercel edition. The repository contains no video, user data, API token or password.
+
+
+## Original-quality portrait/iPhone video (October 2026)
+
+- Upload a **single MP4** through the owner dashboard. The browser sends the file bytes directly to a private Vercel Blob store. **No server-side transcoding, recompression, resolution change, or re-encoding** is performed. A successful upload also checks that the stored byte count matches the local file size.
+- Before upload, the admin page previews the original file and displays its native pixel dimensions, orientation, and size (when the browser can read video metadata). Maximum upload size: **500 MB**.
+- Customer playback starts in **portrait 9:16** (the requested tutorial format), then automatically adapts to the actual dimensions reported by the HTML video element. It uses `object-fit: contain` so the picture is not cropped or stretched.
+- iPhone Safari uses `playsinline`, `webkit-playsinline`, `preload=metadata` and HTTP byte-range requests for normal seeking. Users must tap Play; audio playback does not autoplay.
+- **Focus view** fills the phone screen *inside the webpage*, respects safe areas, and leaves the customer watermark visible. Do not confuse this with the iPhone's native video fullscreen button; native fullscreen can hide HTML overlays.
+- For widest iPhone compatibility, supply an **MP4 with H.264 (AVC) video and AAC audio**, ideally fast-start for progressive MP4. The website **does not convert** unsupported or HEVC-only videos automatically; if you need to convert a source, do it separately before uploading.
+- **Original quality does not mean adaptive streaming**: the browser receives the original bitrate and resolution. Very high-bitrate 4K footage can buffer on slow mobile networks or fail on unsupported phones. A transcoded adaptive stream would require a separate encoding pipeline and could create different quality renditions.
+- A protected MP4 stream is **not DRM**: a determined authenticated viewer can still download or record it. Private Vercel Blob delivery also incurs bandwidth and function usage charges; it is best for low-volume personal testing. Check the Vercel plan's commercial use policy before serving paying customers.
