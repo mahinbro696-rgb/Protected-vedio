@@ -249,6 +249,11 @@ export default async function handler(req,res) {
       if(!/^videos\/tutorial(?:-[a-zA-Z0-9]+)?\.mp4$/.test(pathname))return json(res,400,{error:'Invalid video pathname.'});
       const blob=await findUploadedVideo(pathname);
       if(!blob||blob.size<128||blob.size>MAX_VIDEO_BYTES||blob.contentType!=='video/mp4')return json(res,400,{error:'Uploaded video is invalid.'});
+      // Vercel Blob stores the original file bytes: check size to detect incomplete uploads.
+      if(input && Object.prototype.hasOwnProperty.call(input,'expectedSize') &&
+         (!Number.isSafeInteger(input.expectedSize) || input.expectedSize!==blob.size)) {
+        return json(res,409,{error:'The uploaded file size differs from the original. Please upload again.'});
+      }
       const previous=await loadVideoSettings();
       await saveVideoSettings({pathname:blob.pathname,url:blob.url,size:blob.size,updatedAt:now()},previous?.etag);
       return json(res,200,{ok:true,size:blob.size});
