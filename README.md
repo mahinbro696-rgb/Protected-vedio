@@ -24,7 +24,7 @@ The portal was adapted from the VaultStream Vercel edition. The repository conta
 
 ## Original-quality portrait/iPhone video (October 2026)
 
-- Upload a **single MP4** through the owner dashboard. The browser sends the file bytes directly to a private Vercel Blob store. **No server-side transcoding, recompression, resolution change, or re-encoding** is performed. A successful upload also checks that the stored byte count matches the local file size.
+- Upload a **single MP4** through the owner dashboard using `@vercel/blob/client` with `multipart: true`. For large videos (including the tested 274.5 MB scenario), the browser sends chunks directly to the connected private Vercel Blob store; chunks may retry without re-encoding or quality loss. The dashboard shows MB/percent progress and lets you cancel a stalled upload. A successful upload checks that the stored byte count matches the local file size.
 - Before upload, the admin page previews the original file and displays its native pixel dimensions, orientation, and size (when the browser can read video metadata). Maximum upload size: **500 MB**.
 - Customer playback starts in **portrait 9:16** (the requested tutorial format), then automatically adapts to the actual dimensions reported by the HTML video element. It uses `object-fit: contain` so the picture is not cropped or stretched.
 - iPhone Safari uses `playsinline`, `webkit-playsinline`, `preload=metadata` and HTTP byte-range requests for normal seeking. Users must tap Play; audio playback does not autoplay.
