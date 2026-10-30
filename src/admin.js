@@ -139,11 +139,58 @@ function initDashboard() {
   const upload = byId('upload-btn');
   const progress = byId('upload-progress');
   const drop = byId('drop-zone');
+
+  const preview = byId('upload-preview');
+  const previewFrame = byId('upload-preview-frame');
+  const previewBox = byId('upload-video-details');
+  const previewTitle = byId('upload-video-title');
+  const previewSpecs = byId('upload-video-specs');
+  let localPreviewUrl = '';
+  const clearPreview = () => {
+    preview.pause();
+    preview.removeAttribute('src');
+    preview.load();
+    if (localPreviewUrl) URL.revokeObjectURL(localPreviewUrl);
+    localPreviewUrl = '';
+  };
+  preview.addEventListener('loadedmetadata', () => {
+    const selected = file.files?.[0];
+    if (!selected) return;
+    const width = preview.videoWidth, height = preview.videoHeight;
+    if (!(width > 0 && height > 0)) return;
+    const portrait = height >= width;
+    previewFrame.classList.toggle('is-portrait', portrait);
+    previewSpecs.textContent = width + ' × ' + height + ' pixels · ' +
+      (portrait ? 'Portrait' : 'Landscape') + ' · ' +
+      (selected.size / (1024 * 1024)).toFixed(1) + ' MB';
+  });
+  preview.addEventListener('error', () => {
+    if (file.files?.[0]) {
+      previewSpecs.textContent = 'Preview unavailable in this browser. For iPhone playback, use H.264/AAC MP4.';
+    }
+  });
   file.addEventListener('change', () => {
     const selected = file.files?.[0];
-    upload.disabled = !selected;
-    progress.textContent = selected ? `${selected.name} · ${(selected.size / 1024 / 1024).toFixed(1)} MB` : '';
+    clearPreview();
+    show(previewBox, Boolean(selected));
+    if (!selected) { upload.disabled = true; progress.textContent = ''; return; }
+    const mp4 = selected.type === 'video/mp4' || selected.name.toLowerCase().endsWith('.mp4');
+    const maxSize = 500 * 1024 * 1024;
+    upload.disabled = !mp4 || selected.size > maxSize || selected.size < 128;
+    previewTitle.textContent = selected.name;
+    previewSpecs.textContent = (selected.size / (1024 * 1024)).toFixed(1) +
+      ' MB · Reading original resolution…';
+    progress.textContent = !mp4 ? 'Choose an MP4 video (H.264/AAC recommended).' :
+      selected.size > maxSize ? 'Video is above the 500 MB upload limit.' :
+      selected.size < 128 ? 'Selected file is empty or invalid.' :
+      'Ready — original MP4 will be uploaded without compression.';
+    if (mp4 && selected.size >= 128) {
+      localPreviewUrl = URL.createObjectURL(selected);
+      preview.src = localPreviewUrl;
+      preview.load();
+    }
   });
+  window.addEventListener('pagehide', clearPreview);
   for (const e of ['dragenter','dragover']) drop.addEventListener(e, ev => { ev.preventDefault(); drop.style.borderColor = '#84f0c5'; });
   for (const e of ['dragleave','drop']) drop.addEventListener(e, ev => { ev.preventDefault(); drop.style.borderColor = ''; });
   drop.addEventListener('drop', ev => {
@@ -168,15 +215,16 @@ function initDashboard() {
           progress.textContent = 'Uploading... ' + Math.floor(ev.percentage) + '%';
         },
       });
-      await postJson('/api/admin/video/complete', { pathname: blob.pathname });
+      await postJson('/api/admin/video/complete', { pathname: blob.pathname, expectedSize: selected.size });
       msg('Your tutorial is uploaded to private Vercel Blob storage.');
       progress.textContent = 'Upload complete';
       file.value = '';
+      file.dispatchEvent(new Event('change'));
       await loadDashboard();
     } catch (e) {
       msg(e.message || 'Private upload failed. Please try again.', true);
       progress.textContent = 'Upload failed';
-    } finally { upload.disabled = false; }
+    } finally { upload.disabled = !(file.files?.[0]); }
   });
   loadDashboard();
 }
