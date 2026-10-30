@@ -1,5 +1,3 @@
-import { upload as uploadToBlob } from '@vercel/blob/client';
-
 const byId = id => document.getElementById(id);
 const show = (el, visible) => { if (el) el.hidden = !visible; };
 
@@ -210,82 +208,155 @@ function initDashboard() {
     cancelUpload.disabled = true;
     currentUpload.abort();
   });
+
+  function sendPrivateChunk(ticket, index, chunk, controller, onProgress) {
+    return new Promise((resolve,reject) => {
+      const xhr=new XMLHttpRequest();
+      xhr.open('PUT','/api/admin/video/segment-chunk');
+      xhr.withCredentials=true;
+      xhr.timeout=120000;
+      xhr.setRequestHeader('Content-Type','application/octet-stream');
+      xhr.setRequestHeader('X-Upload-Ticket',ticket);
+      xhr.setRequestHeader('X-Part-Index',String(index));
+      const abort=()=>xhr.abort();
+      controller.signal.addEventListener('abort',abort,{once:true});
+      const cleanup=()=>controller.signal.removeEventListener('abort',abort);
+      xhr.upload.addEventListener('progress',event=>{
+        if(event.lengthComputable)onProgress(Math.min(chunk.size,event.loaded));
+      });
+      xhr.onload=()=>{
+        cleanup();
+        let reply={};
+        try{reply=JSON.parse(xhr.responseText)}catch{}
+        if(xhr.status===200&&reply.ok)resolve(reply);
+        else reject(new Error(reply.error || 'Upload chunk '+(index+1)+' failed with HTTP '+xhr.status));
+      };
+      xhr.onerror=()=>{cleanup();reject(new Error('Connection to video server failed for chunk '+(index+1)));};
+      xhr.ontimeout=()=>{cleanup();reject(new Error('Chunk '+(index+1)+' timed out. Check your connection.'));};
+      xhr.onabort=()=>{cleanup();reject(new DOMException('Upload cancelled','AbortError'));};
+      if(controller.signal.aborted){cleanup();return reject(new DOMException('Upload cancelled','AbortError'));}
+      xhr.send(chunk);
+    });
+  }
+
   upload.addEventListener('click', async () => {
-    const selected = file.files?.[0];
-    if (!selected || currentUpload) return;
-    if (selected.type !== 'video/mp4' && !selected.name.toLowerCase().endsWith('.mp4')) return msg('Please select an MP4 video.', true);
-    if (selected.size > 500 * 1024 * 1024) return msg('The maximum MP4 size is 500 MB.', true);
-    if (selected.size < 128) return msg('This file is empty or invalid.', true);
-    const controller = new AbortController();
-    currentUpload = controller;
-    upload.disabled = true;
-    file.disabled = true;
-    show(progressTrack, true);
-    show(cancelUpload, true);
-    cancelUpload.disabled = false;
-    const bar = byId('progress-fill');
-    bar.style.width = '0%';
-    progressTrack.setAttribute('aria-valuenow', '0');
-    msg('Uploading the original MP4 in reliable chunks — no quality reduction.');
-    progress.textContent = 'Connecting to private storage (0%)...';
-    let sentBytes = 0;
-    const beganAt = Date.now();
-    const waitingMessage = setInterval(() => {
-      if (sentBytes > 0 || controller.signal.aborted) return;
-      const seconds = Math.round((Date.now() - beganAt) / 1000);
-      if (seconds >= 90) {
-        progress.textContent = 'Still 0% after ' + seconds + 's. Check your connection or press Cancel and retry.';
-      } else if (seconds >= 18) {
-        progress.textContent = 'Connecting to private storage... 0% (' + seconds + 's)';
+    const selected=file.files?.[0];
+    if(!selected || currentUpload)return;
+    if(selected.type!=='video/mp4' && !selected.name.toLowerCase().endsWith('.mp4'))
+      return msg('Please select an MP4 file.',true);
+    if(selected.size>500*1024*1024 || selected.size<128)
+      return msg('Select an MP4 between 128 bytes and 500 MB.',true);
+    const controller=new AbortController();
+    currentUpload=controller;
+    file.disabled=true;
+    upload.disabled=true;
+    show(cancelUpload,true);
+    cancelUpload.disabled=false;
+    show(progressTrack,true);
+    const bar=byId('progress-fill');
+    const startedAt=Date.now();
+    let completed=0;
+    let nextIndex=0;
+    let chunksDone=0;
+    let lastActivity=Date.now();
+    const active=new Map();
+    const drawProgress=()=>{
+      const sent=completed + Array.from(active.values()).reduce((sum,n)=>sum+n,0);
+      const percent=Math.min(100,Math.floor(sent/selected.size*100));
+      bar.style.width=percent+'%';
+      progressTrack.setAttribute('aria-valuenow',String(percent));
+      const mb=(sent/1048576).toFixed(1);
+      progress.textContent='Uploading directly to secure website… '+percent+'% ('+
+        mb+' / '+(selected.size/1048576).toFixed(1)+' MB), '+chunksDone+' chunks stored';
+    };
+    bar.style.width='0%';
+    progressTrack.setAttribute('aria-valuenow','0');
+    progress.textContent='Checking authenticated upload service…';
+    msg('Your original MP4 is being transferred in 3 MB secure chunks. No recompression.');
+    const stalled=setInterval(()=>{
+      if(!controller.signal.aborted && Date.now()-lastActivity>20000){
+        const waiting=Math.round((Date.now()-lastActivity)/1000);
+        progress.textContent='Waiting for upload server ('+waiting+'s). You can cancel and retry.';
       }
-    }, 3000);
+    },5000);
     try {
-      const blob = await uploadToBlob('videos/tutorial.mp4', selected, {
-        access: 'private',
-        contentType: 'video/mp4',
-        handleUploadUrl: '/api/admin/upload-token',
-        multipart: true,
-        abortSignal: controller.signal,
-        onUploadProgress(ev) {
-          const loaded = Math.max(0, Number(ev.loaded) || 0);
-          const total = Math.max(1, Number(ev.total) || selected.size);
-          sentBytes = Math.max(sentBytes, loaded);
-          const percentage = Math.max(0, Math.min(100, Math.floor(loaded / total * 100)));
-          bar.style.width = percentage + '%';
-          progressTrack.setAttribute('aria-valuenow', String(percentage));
-          progress.textContent = percentage < 100
-            ? 'Uploading chunks... ' + percentage + '% (' + (loaded / 1048576).toFixed(1) +
-                ' / ' + (total / 1048576).toFixed(1) + ' MB)'
-            : '100% transferred. Finalizing and verifying...';
-        },
+      const init=await api('/api/admin/video/segment-init',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({size:selected.size}),
+        signal:controller.signal,
       });
-      if (controller.signal.aborted) return;
-      progress.textContent = 'Upload transferred. Verifying original file size...';
-      const response = await postJson('/api/admin/video/complete', {
-        pathname: blob.pathname, expectedSize: selected.size,
-      });
-      if (response.size !== selected.size) throw new Error('Stored file size did not match the original.');
-      bar.style.width = '100%';
-      progressTrack.setAttribute('aria-valuenow', '100');
-      msg('Video successfully uploaded with original resolution and quality.');
-      progress.textContent = 'Upload complete — ' + (selected.size / 1048576).toFixed(1) + ' MB';
-      file.value = '';
+      if(typeof init.ticket!=='string'||!Number.isInteger(init.partBytes)||!Number.isInteger(init.partCount))
+        throw new Error('Video upload server did not return a valid secure session.');
+      if(init.partBytes>3.5*1024*1024 || init.partCount!==Math.ceil(selected.size/init.partBytes))
+        throw new Error('Invalid chunk configuration returned by server.');
+      progress.textContent='Secure session ready — sending video chunks…';
+      const uploadOne=async index=>{
+        const from=index*init.partBytes;
+        const piece=selected.slice(from,Math.min(selected.size,from+init.partBytes),'application/octet-stream');
+        for(let attempt=1;attempt<=3;attempt++){
+          if(controller.signal.aborted)throw new DOMException('Upload cancelled','AbortError');
+          try {
+            active.set(index,0);
+            const reply=await sendPrivateChunk(init.ticket,index,piece,controller,loaded=>{
+              active.set(index,loaded);
+              lastActivity=Date.now();
+              drawProgress();
+            });
+            if(reply.bytes!==piece.size)throw new Error('Chunk '+(index+1)+' byte count mismatch');
+            active.delete(index);
+            completed+=piece.size;
+            chunksDone++;
+            lastActivity=Date.now();
+            drawProgress();
+            return;
+          }catch(error){
+            active.delete(index);
+            if(controller.signal.aborted)throw error;
+            if(attempt>=3)throw new Error('Chunk '+(index+1)+' failed after three tries: '+error.message);
+            progress.textContent='Retrying chunk '+(index+1)+' (attempt '+(attempt+1)+'/3): '+error.message;
+            await new Promise(resolve=>setTimeout(resolve,attempt*1300));
+          }
+        }
+      };
+      const worker=async()=>{
+        while(nextIndex<init.partCount){
+          const index=nextIndex++;
+          await uploadOne(index);
+        }
+      };
+      // Two concurrent same-origin requests: avoid Blob CORS/token-handshake stalls.
+      try {
+        await Promise.all([worker(),worker()]);
+      } catch(error) {
+        controller.abort();
+        throw error;
+      }
+      if(controller.signal.aborted)throw new DOMException('Upload cancelled','AbortError');
+      progress.textContent='All chunks received. Checking video integrity…';
+      const completeResult=await postJson('/api/admin/video/segment-finish',{ticket:init.ticket});
+      if(!completeResult.ok || completeResult.size!==selected.size)
+        throw new Error('Final file size verification failed.');
+      bar.style.width='100%';
+      progressTrack.setAttribute('aria-valuenow','100');
+      progress.textContent='Upload complete — '+(selected.size/1048576).toFixed(1)+' MB, original quality';
+      msg('Video saved successfully. Full source resolution and bytes preserved.');
+      file.value='';
       file.dispatchEvent(new Event('change'));
       await loadDashboard();
-    } catch (error) {
-      const cancelled = controller.signal.aborted || error?.name === 'AbortError';
-      const detail = cancelled ? 'Upload cancelled.' : (error?.message || 'Unknown upload error');
-      msg(cancelled ? 'Upload cancelled. Your video was not published.' :
-        'Upload failed: ' + detail + ' · Try again or check browser Network errors.', !cancelled);
-      progress.textContent = cancelled ? 'Cancelled — choose Retry Upload' :
-        'Upload failed. ' + detail;
-    } finally {
-      clearInterval(waitingMessage);
-      currentUpload = null;
-      file.disabled = false;
-      show(cancelUpload, false);
-      cancelUpload.disabled = false;
-      upload.disabled = !(file.files?.[0]);
+    }catch(error){
+      const cancelled=error?.name==='AbortError' || (controller.signal.aborted && !error?.message?.includes('failed after'));
+      msg(cancelled ? 'Upload cancelled. No new video was published.' :
+        'Upload failed: '+(error?.message||'Unknown error'),!cancelled);
+      progress.textContent=cancelled?'Upload cancelled. Click Upload protected video to retry.':
+        'Error: '+(error?.message||'Upload failed. Please retry.');
+    }finally{
+      clearInterval(stalled);
+      currentUpload=null;
+      file.disabled=false;
+      cancelUpload.disabled=false;
+      show(cancelUpload,false);
+      upload.disabled=!file.files?.[0];
     }
   });
   loadDashboard();
