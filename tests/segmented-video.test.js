@@ -56,3 +56,16 @@ test('iPhone video HTTP ranges are bounded and split at private segment boundari
     { index: 1, start: 0, end: 7, length: 8 },
   ]);
 });
+
+test('slicing and reassembling authentic source bytes never changes video quality', () => {
+  const source = Buffer.alloc(SEGMENT_BYTES * 2 + 23);
+  for (let i = 0; i < source.length; i++) source[i] = i % 251;
+  const saved = [];
+  for (let p = 0; p < Math.ceil(source.length / SEGMENT_BYTES); p++)
+    saved.push(Buffer.from(source.subarray(p * SEGMENT_BYTES, (p + 1) * SEGMENT_BYTES)));
+  const start = SEGMENT_BYTES - 5, end = SEGMENT_BYTES + 8;
+  const restored = Buffer.concat(videoSegmentSlices(start, end).map(span =>
+    saved[span.index].subarray(span.start, span.end + 1)));
+  assert.deepEqual(restored, source.subarray(start, end + 1));
+  assert.deepEqual(Buffer.concat(saved), source);
+});
