@@ -1,9 +1,8 @@
 import { randomBytes } from 'node:crypto';
 import { Readable } from 'node:stream';
-import { handleUpload } from '@vercel/blob/client';
 import { put, head } from '@vercel/blob';
 import {
-  SEGMENT_BYTES, MAX_VIDEO_BYTES as MAX_ORIGINAL_VIDEO_BYTES,
+  SEGMENT_BYTES,
   validVideoSize, makeUploadTicket, readUploadTicket,
   expectedSegmentBytes, partPath, parseVideoRange, videoSegmentSlices,
 } from '../lib/segmented-video.js';
@@ -13,12 +12,11 @@ import {
   publicCustomer,validHours,CUSTOMER_ID,splitCustomerToken,
 } from '../lib/security.js';
 import {
-  loadCustomer,saveCustomer,listCustomers,loadVideoSettings,saveVideoSettings,findUploadedVideo,
+  loadCustomer,saveCustomer,listCustomers,loadVideoSettings,saveVideoSettings,
 } from '../lib/blob-store.js';
 
 const ONE_HOUR = 3600000;
 const MEDIA_CHUNK = 2 * 1024 * 1024;
-const MAX_VIDEO_BYTES = 500 * 1024 * 1024;
 const ADMIN_COOKIE = '__Host-vault-admin';
 const VIEWER_COOKIE = '__Host-vault-viewer';
 const attempts = new Map(); // Best-effort per-instance protection. Use platform WAF for production.
@@ -200,9 +198,7 @@ export default async function handler(req,res) {
     if(!safeHost(req.headers.host))return json(res,421,{error:'Unrecognized host.'});
     if(!process.env.SESSION_SECRET||!process.env.ADMIN_PASSWORD_HASH)return json(res,503,{error:'Admin credentials have not been configured.'});
     if(!process.env.BLOB_READ_WRITE_TOKEN && process.env.VIDEO_MODE!=='vdocipher')return notReady(res);
-    // The blob upload-complete callback is authenticated by the Blob SDK and may be cross-site.
-    const isUploadCallback=route==='/api/admin/upload-token' && method==='POST' && bodyObject(req)?.type==='blob.upload-completed';
-    if(['POST','PUT','DELETE'].includes(method)&&!isUploadCallback&&!validOrigin(req))return json(res,403,{error:'Cross-site requests are not allowed.'});
+    if(['POST','PUT','DELETE'].includes(method)&&!validOrigin(req))return json(res,403,{error:'Cross-site requests are not allowed.'});
 
     if(method==='GET'&&route==='/health')return json(res,200,{ok:true,storageConfigured:!!process.env.BLOB_READ_WRITE_TOKEN,mode:process.env.VIDEO_MODE==='vdocipher'?'vdocipher':'blob'});
     if(method==='GET'&&route==='/')return html(res,200,'Private tutorial portal',HOME);
@@ -353,36 +349,6 @@ export default async function handler(req,res) {
       return json(res,200,{ok:true,size:session.size,segments:session.partCount});
     }
 
-    if(method==='POST'&&route==='/api/admin/upload-token'){
-      const body=bodyObject(req);
-      if(body?.type==='blob.generate-client-token'&&!requireAdmin(req,res))return;
-      // The callback signature is verified by handleUpload internally.
-      if(!body||!['blob.generate-client-token','blob.upload-completed'].includes(body.type))return json(res,400,{error:'Invalid upload handshake.'});
-      const r=await handleUpload({body,request:req,
-        onBeforeGenerateToken:async pathname=>{
-          if(!isAdmin(req))throw Error('Admin login required');
-          if(pathname!=='videos/tutorial.mp4')throw Error('Invalid video pathname');
-          return {allowedContentTypes:['video/mp4'],maximumSizeInBytes:MAX_VIDEO_BYTES,addRandomSuffix:true};
-        },
-        onUploadCompleted:async()=>{},
-      });
-      return json(res,200,r);
-    }
-    if(method==='POST'&&route==='/api/admin/video/complete'){
-      if(!requireAdmin(req,res))return;
-      const input=bodyObject(req);const pathname=String(input?.pathname||'');
-      if(!/^videos\/tutorial(?:-[a-zA-Z0-9]+)?\.mp4$/.test(pathname))return json(res,400,{error:'Invalid video pathname.'});
-      const blob=await findUploadedVideo(pathname);
-      if(!blob||blob.size<128||blob.size>MAX_VIDEO_BYTES||blob.contentType!=='video/mp4')return json(res,400,{error:'Uploaded video is invalid.'});
-      // Vercel Blob stores the original file bytes: check size to detect incomplete uploads.
-      if(input && Object.prototype.hasOwnProperty.call(input,'expectedSize') &&
-         (!Number.isSafeInteger(input.expectedSize) || input.expectedSize!==blob.size)) {
-        return json(res,409,{error:'The uploaded file size differs from the original. Please upload again.'});
-      }
-      const previous=await loadVideoSettings();
-      await saveVideoSettings({pathname:blob.pathname,url:blob.url,size:blob.size,updatedAt:now()},previous?.etag);
-      return json(res,200,{ok:true,size:blob.size});
-    }
     return route.startsWith('/api/')?json(res,404,{error:'Unknown endpoint.'}):html(res,404,'Not found',UNKNOWN);
   }catch(error){
     console.error('VaultStream request error',error?.name||'Error',String(error?.message||'').slice(0,180));
