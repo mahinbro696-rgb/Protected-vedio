@@ -1,6 +1,12 @@
 import { randomBytes } from 'node:crypto';
 import { Readable } from 'node:stream';
 import { handleUpload } from '@vercel/blob/client';
+import { put, head } from '@vercel/blob';
+import {
+  SEGMENT_BYTES, MAX_VIDEO_BYTES as MAX_ORIGINAL_VIDEO_BYTES,
+  validVideoSize, makeUploadTicket, readUploadTicket,
+  expectedSegmentBytes, partPath, parseVideoRange, videoSegmentSlices,
+} from '../lib/segmented-video.js';
 import {page,HOME,ADMIN_LOGIN,ADMIN_DASH,WATCH_PAGE,UNKNOWN,accessPage} from '../lib/ui.js';
 import {
   uid,hash,now,passwordMatches,mintAdminCookie,checkAdminCookie,parseCookies,
@@ -76,7 +82,7 @@ function customerLink(req,customer,token){ return `${originOf(req)}/access/${cus
 async function videoReady() {
   if(process.env.VIDEO_MODE==='vdocipher')return { mode:'vdocipher',configured:!!(process.env.VDO_CIPHER_VIDEO_ID&&process.env.VDO_CIPHER_API_SECRET),size:0 };
   const record=await loadVideoSettings();
-  return {mode:'blob',configured:!!(record?.data?.url && record?.data?.size),size:record?.data?.size||0,video:record?.data};
+  return {mode:'blob',configured:!!(record?.data?.size && (record?.data?.url || (record?.data?.mode === 'segments' && record?.data?.parts?.length))),size:record?.data?.size||0,video:record?.data};
 }
 async function vdoPlayback(req,res,customer) {
   if(!process.env.VDO_CIPHER_API_SECRET || !process.env.VDO_CIPHER_VIDEO_ID)return json(res,503,{error:'DRM provider not configured.'});
@@ -94,11 +100,70 @@ async function vdoPlayback(req,res,customer) {
   return json(res,200,{iframeUrl:`https://player.vdocipher.com/v2/?${query}`});
 }
 
+
+async function streamSegmentedVideo(req, res, video) {
+  const size = Number(video.size);
+  const urls = video.parts;
+  if (!Number.isSafeInteger(size) || size < 128 || !Array.isArray(urls) ||
+      !Number.isSafeInteger(video.partBytes) || video.partBytes !== SEGMENT_BYTES ||
+      urls.length !== Math.ceil(size / SEGMENT_BYTES)) {
+    return json(res, 500, {error:'Private segmented video metadata is invalid.'});
+  }
+  const range = parseVideoRange(req.headers.range, size);
+  if (!range) return send(res, 416, 'Invalid MP4 byte range', 'text/plain', {'Content-Range':'bytes */'+size});
+  const {start,end} = range;
+  const headers = {
+    'Content-Type':'video/mp4',
+    'Content-Disposition':'inline',
+    'Accept-Ranges':'bytes',
+    'Content-Range':'bytes '+start+'-'+end+'/'+size,
+    'Content-Length':String(end-start+1),
+    'Cache-Control':'private, no-store, max-age=0',
+  };
+  if (req.method === 'HEAD') return send(res,206,'','video/mp4',headers);
+  const spans = videoSegmentSlices(start, end);
+  const buffers = [];
+  for (const span of spans) {
+    const storedUrl = urls[span.index];
+    let parsed;
+    try { parsed = new URL(storedUrl); } catch { return json(res,502,{error:'Invalid private segment URL.'}); }
+    if (parsed.protocol !== 'https:' || !parsed.hostname.endsWith('.private.blob.vercel-storage.com')) {
+      return json(res,502,{error:'Video segment must use private storage.'});
+    }
+    const response = await fetch(parsed, {
+      headers:{
+        'Authorization':'Bearer '+process.env.BLOB_READ_WRITE_TOKEN,
+        'Range':'bytes='+span.start+'-'+span.end,
+      },
+      cache:'no-store',
+      signal:AbortSignal.timeout(25_000),
+    });
+    if ((response.status !== 206 && response.status !== 200) || !response.body) {
+      response.body?.cancel().catch(()=>{});
+      return json(res,502,{error:'Private video segment is temporarily unavailable.'});
+    }
+    const data = Buffer.from(await response.arrayBuffer());
+    if (response.status === 206) {
+      if (data.length !== span.length) return json(res,502,{error:'Short read while playing MP4.'});
+      buffers.push(data);
+    } else {
+      if (data.length < span.end + 1) return json(res,502,{error:'Incomplete private video segment.'});
+      buffers.push(data.subarray(span.start,span.end+1));
+    }
+  }
+  const output = Buffer.concat(buffers);
+  if (output.length !== end-start+1) return json(res,502,{error:'MP4 segment data is incomplete.'});
+  res.statusCode = 206;
+  for (const [key,value] of Object.entries(headers)) res.setHeader(key,value);
+  return res.end(output);
+}
+
 async function streamVideo(req,res) {
   const viewer=await requireViewer(req,res); if(!viewer)return;
   if(process.env.VIDEO_MODE==='vdocipher')return json(res,404,{error:'Local streaming disabled in DRM mode.'});
   const record=await loadVideoSettings();
   const video=record?.data;
+  if (video?.mode === 'segments') return streamSegmentedVideo(req,res,video);
   if(!video?.url || !video?.size)return json(res,404,{error:'Video not uploaded yet.'});
   const url=new URL(video.url);
   if(url.protocol!=='https:'||!url.hostname.endsWith('.private.blob.vercel-storage.com'))return json(res,500,{error:'Invalid private video store configuration.'});
@@ -228,6 +293,66 @@ export default async function handler(req,res) {
       const c=await requireViewer(req,res);if(!c)return;
       return vdoPlayback(req,res,c);
     }
+
+    // Same-origin fallback: the browser uploads 3 MiB at a time to this Function.
+    // No browser-to-Blob cross-origin handshake is needed, and every byte stays unchanged.
+    if(method==='POST'&&route==='/api/admin/video/segment-init'){
+      if(!requireAdmin(req,res))return;
+      const size=Number(bodyObject(req)?.size);
+      if(!validVideoSize(size))return json(res,400,{error:'Select an MP4 between 128 bytes and 500 MB.'});
+      const session=makeUploadTicket(size,process.env.SESSION_SECRET);
+      return json(res,200,{ticket:session.ticket,partBytes:session.partBytes,partCount:session.partCount,size:session.size});
+    }
+    if(method==='PUT'&&route==='/api/admin/video/segment-chunk'){
+      if(!requireAdmin(req,res))return;
+      const session=readUploadTicket(req.headers['x-upload-ticket'],process.env.SESSION_SECRET);
+      if(!session)return json(res,403,{error:'Upload session is invalid or expired. Restart the upload.'});
+      const index=Number(req.headers['x-part-index']);
+      const expected=expectedSegmentBytes(session,index);
+      if(expected===null)return json(res,400,{error:'Invalid upload chunk index.'});
+      if(!String(req.headers['content-type']||'').startsWith('application/octet-stream'))
+        return json(res,415,{error:'Upload chunks must contain original binary MP4 bytes.'});
+      const data=req.body;
+      if(!Buffer.isBuffer(data))return json(res,400,{error:'Binary upload body could not be read. Please retry.'});
+      if(data.length!==expected)return json(res,422,{error:'Video chunk size did not match the original.'});
+      if(index===0 && (data.length<12||data.toString('ascii',4,8)!=='ftyp'))
+        return json(res,415,{error:'This file is not a supported MP4 (missing ftyp header).'});
+      await put(partPath(session,index),data,{
+        access:'private',contentType:'application/octet-stream',allowOverwrite:true,
+        cacheControlMaxAge:60,
+      });
+      return json(res,200,{ok:true,index,bytes:data.length});
+    }
+    if(method==='POST'&&route==='/api/admin/video/segment-finish'){
+      if(!requireAdmin(req,res))return;
+      const ticket=String(bodyObject(req)?.ticket||'');
+      const session=readUploadTicket(ticket,process.env.SESSION_SECRET);
+      if(!session)return json(res,403,{error:'Upload session expired. Please restart the upload.'});
+      const parts=new Array(session.partCount);
+      // Verify every part server-side before publishing the video to customers.
+      for(let offset=0;offset<session.partCount;offset+=8){
+        const indexes=Array.from({length:Math.min(8,session.partCount-offset)},(_,n)=>offset+n);
+        const found=await Promise.all(indexes.map(async index=>{
+          try { return await head(partPath(session,index)); } catch { return null; }
+        }));
+        for(let i=0;i<indexes.length;i++){
+          const index=indexes[i], item=found[i];
+          if(!item||item.size!==expectedSegmentBytes(session,index))
+            return json(res,409,{error:'A video chunk is incomplete (#'+(index+1)+'). Please retry upload.'});
+          const url=new URL(item.url);
+          if(url.protocol!=='https:'||!url.hostname.endsWith('.private.blob.vercel-storage.com'))
+            return json(res,500,{error:'Video chunk is not in private storage.'});
+          parts[index]=item.url;
+        }
+      }
+      const previous=await loadVideoSettings();
+      await saveVideoSettings({
+        mode:'segments',size:session.size,partBytes:session.partBytes,
+        parts,updatedAt:now(),
+      },previous?.etag);
+      return json(res,200,{ok:true,size:session.size,segments:session.partCount});
+    }
+
     if(method==='POST'&&route==='/api/admin/upload-token'){
       const body=bodyObject(req);
       if(body?.type==='blob.generate-client-token'&&!requireAdmin(req,res))return;
