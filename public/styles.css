@@ -56,3 +56,10 @@ body.viewer-focus .focus-button{background:#284c61;border-color:#61968e}
   .upload-preview-frame{width:85px;min-width:85px}
   .player-tools{gap:6px}
 }
+
+/* Large MP4 upload progress and retry controls */
+.upload-actions{flex-wrap:wrap;row-gap:10px}
+.upload-actions #upload-progress{flex:1;min-width:175px;line-height:1.6;overflow-wrap:anywhere}
+.upload-actions #upload-cancel-btn{flex:0 0 auto}
+.progress-track{height:8px}
+.progress-fill{transition:width .15s linear}
